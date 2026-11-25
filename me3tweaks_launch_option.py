@@ -21,7 +21,7 @@
 # This code is also licensed under the GNU General Public License v3.0 or later, as stated above.
 
 
-"""Minimal non-GUI launcher option patcher for Steam appinfo data.
+"""Minimal non-GUI launcher option patcher for Steam appinfo.vdf.
 
 Adds or updates one launch option named "ME3Tweaks Mod Manager" for the
 provided app IDs ("pfx IDs").
@@ -32,17 +32,13 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import struct
 from hashlib import sha1
-from struct import pack, pack_into, unpack, unpack_from
+from struct import pack, unpack
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
 APPINFO_29 = 0x107564429
 APPINFO_28 = 0x107564428
-APPINFO_42 = 0x10756442A
-APPINFO_42_MAGIC = b"*DV\x07"
-APPINFO_42_HEADER_SIZE = 44
 
 
 class IncompatibleVDFError(Exception):
@@ -72,16 +68,6 @@ class Appinfo:
         self.INT_TYPE_STRING = int.from_bytes(self.TYPE_STRING, "little")
         self.INT_TYPE_INT32 = int.from_bytes(self.TYPE_INT32, "little")
         self.INT_SECTION_END = int.from_bytes(self.SECTION_END, "little")
-
-        self.v42_shards = {}
-        self.v42_app_shards = {}
-        self.updated_apps = set()
-        if os.path.isdir(self.vdf_path):
-            self.version = APPINFO_42
-            self.appinfoData = bytearray()
-            self.parsedAppInfo = {}
-            self.read_v42_shards()
-            return
 
         with open(self.vdf_path, "rb") as vdf:
             self.appinfoData = bytearray(vdf.read())
@@ -150,7 +136,7 @@ class Appinfo:
             if value_type == self.INT_SECTION_END:
                 break
 
-            if self.version in (APPINFO_29, APPINFO_42):
+            if self.version == APPINFO_29:
                 key = self.read_string_appinfo29()
             else:
                 key = self.read_string()
@@ -159,132 +145,6 @@ class Appinfo:
             subsection[key] = value
 
         return subsection
-
-    def read_v42_shards(self):
-        shard_names = sorted(
-            name
-            for name in os.listdir(self.vdf_path)
-            if re.fullmatch(r"appinfo_[0-9a-fA-F]{2}\.vdf", name)
-        )
-        if not shard_names:
-            raise ValueError(f"No appinfo shard files found in: {self.vdf_path}")
-
-        for shard_name in shard_names:
-            shard_path = os.path.join(self.vdf_path, shard_name)
-            with open(shard_path, "rb") as shard_file:
-                data = shard_file.read()
-
-            if len(data) < APPINFO_42_HEADER_SIZE:
-                raise ValueError(f"Truncated appinfo shard: {shard_path}")
-
-            (
-                magic,
-                universe,
-                shard_index,
-                shard_count,
-                app_count,
-                index_bytes,
-                key_count,
-                key_bytes,
-                data_bytes,
-            ) = struct.unpack_from("<4s8I", data)
-            expected_size = APPINFO_42_HEADER_SIZE + index_bytes + key_bytes + data_bytes
-            if magic != APPINFO_42_MAGIC or expected_size != len(data):
-                raise ValueError(f"Invalid appinfo shard header: {shard_path}")
-            if shard_count != 256 or shard_index != int(shard_name[8:10], 16):
-                raise ValueError(f"Unexpected appinfo shard index: {shard_path}")
-
-            index_start = APPINFO_42_HEADER_SIZE
-            index_end = index_start + index_bytes
-            records = []
-            offset = index_start
-            for _ in range(app_count):
-                record_start = offset
-                if offset + 66 > index_end:
-                    raise ValueError(f"Truncated appinfo shard index: {shard_path}")
-
-                app_id, payload_offset, payload_size = struct.unpack_from(
-                    "<III", data, offset
-                )
-                offset += 62
-                subkey_count = struct.unpack_from("<I", data, offset)[0]
-                offset += 4 + subkey_count * 4 + 13
-                name_end = data.find(b"\0", offset, index_end)
-                if name_end < 0:
-                    raise ValueError(f"Invalid appinfo shard index: {shard_path}")
-                offset = name_end + 1
-
-                if payload_offset + payload_size > data_bytes:
-                    raise ValueError(f"Invalid appinfo payload bounds: {shard_path}")
-                if app_id in self.v42_app_shards:
-                    raise ValueError(f"Duplicate app ID in appinfo shards: {app_id}")
-
-                records.append(
-                    {
-                        "appid": app_id,
-                        "offset": payload_offset,
-                        "size": payload_size,
-                        "raw": data[record_start:offset],
-                    }
-                )
-
-            if offset != index_end:
-                raise ValueError(f"Invalid appinfo shard index size: {shard_path}")
-
-            key_table_start = index_end
-            key_table_end = key_table_start + key_bytes
-            keys = []
-            key_offset = key_table_start
-            for _ in range(key_count):
-                key_end = data.find(b"\0", key_offset, key_table_end)
-                if key_end < 0:
-                    raise ValueError(f"Invalid appinfo key table: {shard_path}")
-                keys.append(data[key_offset:key_end].decode("utf-8", errors="replace"))
-                key_offset = key_end + 1
-            if key_offset != key_table_end:
-                raise ValueError(f"Invalid appinfo key table size: {shard_path}")
-
-            data_start = key_table_end
-            shard = {
-                "path": shard_path,
-                "header": data[:APPINFO_42_HEADER_SIZE],
-                "records": records,
-                "keys": keys,
-                "key_table_bytes": data[key_table_start:key_table_end],
-                "original_key_count": len(keys),
-                "data": data[data_start:],
-                "updated": set(),
-            }
-            self.v42_shards[shard_path] = shard
-
-            for record in records:
-                app_id = record["appid"]
-                self.v42_app_shards[app_id] = shard_path
-                if record["size"] == 0:
-                    continue
-
-                payload_start = record["offset"]
-                payload_end = payload_start + record["size"]
-                payload = shard["data"][payload_start:payload_end]
-                if len(payload) < 20:
-                    raise ValueError(f"Truncated appinfo payload for app {app_id}")
-
-                self.appinfoData = bytearray(payload[20:])
-                self.string_pool = keys
-                self.offset = 0
-                try:
-                    sections = self.parse_subsections()
-                except (IndexError, KeyError, struct.error) as exc:
-                    raise ValueError(
-                        f"Unable to parse appinfo payload for app {app_id}"
-                    ) from exc
-
-                self.parsedAppInfo[app_id] = {
-                    "appid": app_id,
-                    "sections": sections,
-                    "installed": False,
-                    "install_path": ".",
-                }
 
     def read_header(self):
         keys = [
@@ -380,19 +240,14 @@ class Appinfo:
             index = self.string_pool.index(key)
         except ValueError:
             self.string_pool.append(key)
-            if self.version != APPINFO_42:
-                self.appinfoData += self.encode_string(key)
+            self.appinfoData += self.encode_string(key)
         index = self.string_pool.index(key)
         return self.encode_uint32(index)
 
     def encode_subsections(self, data):
         encoded_data = bytearray()
         for key, value in data.items():
-            key = (
-                self.encode_string(key)
-                if self.version == APPINFO_28
-                else self.encode_key_appinfo29(key)
-            )
+            key = self.encode_string(key) if self.version == APPINFO_28 else self.encode_key_appinfo29(key)
             if isinstance(value, dict):
                 encoded_data += self.TYPE_DICT + key + self.encode_subsections(value)
             elif isinstance(value, str):
@@ -428,12 +283,6 @@ class Appinfo:
         self.appinfoData[string_table_offset:string_table_offset + 4] = encoded_string_count
 
     def update_app(self, app_id):
-        if self.version == APPINFO_42:
-            shard_path = self.v42_app_shards[app_id]
-            self.v42_shards[shard_path]["updated"].add(app_id)
-            self.updated_apps.add(app_id)
-            return
-
         appinfo = self.parsedAppInfo[app_id]
         encoded_subsections = self.encode_subsections(appinfo["sections"])
         old_header = self.encode_header(appinfo)
@@ -457,71 +306,10 @@ class Appinfo:
             self.appinfoData.extend(updated_header + encoded_subsections)
 
     def write_data(self):
-        if self.version == APPINFO_42:
-            self.write_v42_shards()
-            return
-
         if self.version == APPINFO_29:
             self.update_string_offset_and_count()
         with open(self.vdf_path, "wb") as vdf:
             vdf.write(self.appinfoData)
-
-    def write_v42_shards(self):
-        outputs = []
-        for shard in self.v42_shards.values():
-            if not shard["updated"]:
-                continue
-
-            keys = shard["keys"]
-            payloads = {}
-            for record in shard["records"]:
-                app_id = record["appid"]
-                if app_id not in shard["updated"]:
-                    continue
-
-                self.string_pool = keys
-                self.appinfoData = bytearray()
-                encoded_vdf = self.encode_subsections(
-                    self.parsedAppInfo[app_id]["sections"]
-                )
-                payloads[app_id] = sha1(encoded_vdf).digest() + encoded_vdf
-
-            new_data = bytearray()
-            new_index = bytearray()
-            for record in shard["records"]:
-                app_id = record["appid"]
-                payload = payloads.get(app_id)
-                if payload is None:
-                    start = record["offset"]
-                    end = start + record["size"]
-                    payload = shard["data"][start:end]
-
-                new_offset = len(new_data)
-                new_data.extend(payload)
-                new_index.extend(
-                    pack("<III", app_id, new_offset, len(payload))
-                    + record["raw"][12:]
-                )
-
-            new_keys = keys[shard["original_key_count"]:]
-            key_table = shard["key_table_bytes"] + b"".join(
-                self.encode_string(key) for key in new_keys
-            )
-            header = bytearray(shard["header"])
-            pack_into("<I", header, 20, len(new_index))
-            pack_into("<I", header, 24, len(keys))
-            pack_into("<I", header, 28, len(key_table))
-            pack_into("<I", header, 32, len(new_data))
-            outputs.append(
-                (
-                    shard["path"],
-                    bytes(header + new_index + key_table + new_data),
-                )
-            )
-
-        for shard_path, output in outputs:
-            with open(shard_path, "wb") as shard_file:
-                shard_file.write(output)
 
     def dict_to_text_vdf(self, data, number_of_tabs=0):
         formatted_data = b""
@@ -872,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Add/update one launch option named 'ME3Tweaks Mod Manager' for "
-            "the given app IDs in Steam appinfo data"
+            "the given app IDs in Steam appinfo.vdf"
         )
     )
     parser.add_argument(
@@ -918,27 +706,9 @@ def main() -> int:
         return 2
 
     steam_path = os.path.abspath(args.steam_path)
-    appcache_path = os.path.join(steam_path, "appcache")
-    shard_dir = os.path.join(appcache_path, "appinfo")
-    legacy_vdf_path = os.path.join(appcache_path, "appinfo.vdf")
-    shard_files = []
-    if os.path.isdir(shard_dir):
-        shard_files = [
-            name
-            for name in os.listdir(shard_dir)
-            if re.fullmatch(r"appinfo_[0-9a-fA-F]{2}\.vdf", name)
-            and os.path.isfile(os.path.join(shard_dir, name))
-        ]
-
-    if shard_files:
-        vdf_path = shard_dir
-    elif os.path.isfile(legacy_vdf_path):
-        vdf_path = legacy_vdf_path
-    else:
-        print(
-            "Error: Steam appinfo data not found. Expected "
-            f"{legacy_vdf_path} or appinfo shard files in {shard_dir}"
-        )
+    vdf_path = os.path.join(steam_path, "appcache", "appinfo.vdf")
+    if not os.path.isfile(vdf_path):
+        print(f"Error: appinfo.vdf not found at: {vdf_path}")
         return 2
 
     exe_input = ""
@@ -955,9 +725,6 @@ def main() -> int:
         appinfo = Appinfo(vdf_path)
     except IncompatibleVDFError as exc:
         print(f"Error: unsupported appinfo.vdf version: {exc.vdf_version:#08x}")
-        return 2
-    except (OSError, ValueError, struct.error) as exc:
-        print(f"Error: unable to read Steam appinfo data: {exc}")
         return 2
 
     libraries = read_library_paths(steam_path)

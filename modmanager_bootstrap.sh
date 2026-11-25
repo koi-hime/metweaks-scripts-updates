@@ -211,12 +211,12 @@ shared_m3_config() {
 normalize_steam_root() {
     local candidate="$1"
 
-    if [[ -d "$candidate/steamapps" && ( -f "$candidate/appcache/appinfo.vdf" || -d "$candidate/appcache/appinfo" ) ]]; then
+    if [[ -d "$candidate/steamapps" && -f "$candidate/appcache/appinfo.vdf" ]]; then
         printf '%s\n' "$candidate"
         return 0
     fi
 
-    if [[ -d "$candidate/steam/steamapps" && ( -f "$candidate/steam/appcache/appinfo.vdf" || -d "$candidate/steam/appcache/appinfo" ) ]]; then
+    if [[ -d "$candidate/steam/steamapps" && -f "$candidate/steam/appcache/appinfo.vdf" ]]; then
         printf '%s\n' "$candidate/steam"
         return 0
     fi
