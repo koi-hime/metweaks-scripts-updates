@@ -36,6 +36,7 @@ import struct
 from hashlib import sha1
 from struct import pack, pack_into, unpack, unpack_from
 from typing import Dict, Iterable, List, Optional, Tuple
+from zlib import crc32
 
 
 APPINFO_29 = 0x107564429
@@ -512,6 +513,10 @@ class Appinfo:
             pack_into("<I", header, 24, len(keys))
             pack_into("<I", header, 28, len(key_table))
             pack_into("<I", header, 32, len(new_data))
+            # Steam checks the index and key table before accepting a shard.
+            pack_into("<I", header, 36, crc32(new_index + key_table) & 0xFFFFFFFF)
+            # Steam validates this CRC over the preceding 40 header bytes.
+            pack_into("<I", header, 40, crc32(header[:40]) & 0xFFFFFFFF)
             outputs.append(
                 (
                     shard["path"],
@@ -839,7 +844,7 @@ def upsert_launch_option(
         "executable": executable,
         "workingdir": workingdir,
         "arguments": "",
-        "config": {"oslist": "windows"},
+        "config": {"oslist": "linux"},
     }
 
 
